@@ -1,0 +1,851 @@
+openapi: 3.0.3
+
+info:
+  title: Mensajería de Barrio API
+  version: 0.1.0
+  description: |
+    API del sistema de gestión de envíos en moto (Escenario 3A).
+
+    **Arquitectura:** monolito modular desplegado en un único servidor virtual
+    de bajo costo (RNF 04). Una sola API REST atiende a los tres roles:
+
+    - **Cliente:** crea envíos y consulta su estado.
+    - **Operador:** asigna envíos a cadetes.
+    - **Cadete:** actualiza el estado de los envíos que tiene asignados.
+
+    Ante cada cambio de estado el sistema envía un mail al cliente. Las
+    notificaciones son internas (no se exponen como endpoints).
+
+    **Corte implementado:** login + asignación de un envío a un cadete +
+    consulta del estado por parte del cliente. Los endpoints que forman
+    parte del corte están marcados con `x-corte: true`.
+  contact:
+    name: Grupo 3A - Arquitectura de Software 2C 2026
+
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Desarrollo local
+  - url: https://mensajeria.example.com/api/v1
+    description: Producción (servidor virtual único)
+
+tags:
+  - name: Auth
+    description: Inicio de sesión y datos del usuario autenticado.
+  - name: Envíos
+    description: Alta, consulta y seguimiento de envíos.
+  - name: Asignación
+    description: Asignación de envíos a cadetes (rol operador).
+  - name: Estados
+    description: Cambios de estado de un envío (rol cadete).
+  - name: Cadetes
+    description: Consulta de cadetes disponibles (rol operador).
+
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Iniciar sesión
+      description: |
+        Valida email y contraseña y devuelve un token JWT. El token incluye
+        el rol del usuario (`CLIENTE`, `OPERADOR` o `CADETE`), que el
+        backend usa para autorizar cada operación.
+      operationId: login
+      x-corte: true
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: operador@mensajeria.com
+              password: secreto123
+      responses:
+        '200':
+          description: Credenciales válidas.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Email o contraseña incorrectos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                codigo: CREDENCIALES_INVALIDAS
+                mensaje: Email o contraseña incorrectos.
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Obtener el usuario autenticado
+      operationId: getMe
+      x-corte: true
+      responses:
+        '200':
+          description: Datos del usuario dueño del token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Usuario'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /envios:
+    get:
+      tags: [Envíos]
+      summary: Listar envíos
+      description: |
+        Devuelve los envíos visibles para el usuario autenticado. El backend
+        filtra según el rol del token:
+
+        | Rol | Ve |
+        |---|---|
+        | `CLIENTE` | Solo los envíos que creó. |
+        | `CADETE` | Solo los envíos que tiene asignados. |
+        | `OPERADOR` | Todos los envíos. |
+
+        Uso típico del operador: `GET /envios?estado=PENDIENTE` para ver los
+        envíos que faltan asignar.
+      operationId: listarEnvios
+      x-corte: true
+      parameters:
+        - name: estado
+          in: query
+          description: Filtra por uno o más estados (`?estado=PENDIENTE&estado=ASIGNADO`).
+          required: false
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/EstadoEnvio'
+        - name: cadeteId
+          in: query
+          description: Filtra por cadete asignado. Solo lo puede usar el operador.
+          required: false
+          schema:
+            type: integer
+            format: int64
+        - name: desde
+          in: query
+          description: Envíos creados a partir de esta fecha (inclusive).
+          required: false
+          schema:
+            type: string
+            format: date
+            example: '2026-10-22'
+        - name: hasta
+          in: query
+          description: Envíos creados hasta esta fecha (inclusive).
+          required: false
+          schema:
+            type: string
+            format: date
+            example: '2026-10-22'
+        - $ref: '#/components/parameters/Pagina'
+        - $ref: '#/components/parameters/TamanioPagina'
+      responses:
+        '200':
+          description: Página de envíos, ordenada del más reciente al más antiguo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginaEnvios'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      tags: [Envíos]
+      summary: Crear un envío
+      description: |
+        **Rol requerido:** `CLIENTE`.
+
+        Crea un envío en estado `PENDIENTE`. Durante el alta el backend
+        consulta **una única vez** al servicio externo de mapas para
+        geocodificar las direcciones y estimar el tiempo de viaje. El
+        resultado se guarda en el envío y no se vuelve a pedir, porque ese
+        servicio cobra por consulta (NFR de costo).
+
+        Si el servicio de mapas no responde, el envío se crea igual con
+        `latitud`, `longitud` y `tiempoEstimadoMinutos` en `null`: el
+        negocio puede operar sin esos datos.
+      operationId: crearEnvio
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CrearEnvioRequest'
+            example:
+              origen:
+                calle: Av. Rivadavia 5200
+                localidad: CABA
+                referencias: Local a la calle, timbre 2
+              destino:
+                calle: Av. Corrientes 1234, piso 3 B
+                localidad: CABA
+              destinatario:
+                nombre: María Gómez
+                telefono: '+54 11 5555-1234'
+              descripcion: Sobre con documentación contable
+      responses:
+        '201':
+          description: Envío creado.
+          headers:
+            Location:
+              description: URL del envío creado.
+              schema:
+                type: string
+                example: /api/v1/envios/42
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnvioDetalle'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /envios/{envioId}:
+    parameters:
+      - $ref: '#/components/parameters/EnvioId'
+    get:
+      tags: [Envíos]
+      summary: Consultar un envío
+      description: |
+        Devuelve el envío con su estado actual y el historial completo de
+        cambios. Es la pantalla de seguimiento del cliente.
+
+        Si el envío no es visible para el usuario (por ejemplo, un cliente
+        consultando un envío de otro cliente) se responde `404` y no `403`,
+        para no revelar qué IDs existen.
+      operationId: obtenerEnvio
+      x-corte: true
+      responses:
+        '200':
+          description: Envío encontrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnvioDetalle'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /envios/{envioId}/asignacion:
+    parameters:
+      - $ref: '#/components/parameters/EnvioId'
+    put:
+      tags: [Asignación]
+      summary: Asignar (o reasignar) un envío a un cadete
+      description: |
+        **Rol requerido:** `OPERADOR`.
+
+        Asigna el envío al cadete indicado. Es el caso de uso mínimo del corte.
+
+        - Si el envío está `PENDIENTE`: pasa a `ASIGNADO`, se registra el
+          cambio en el historial y **se envía un mail al cliente**.
+        - Si ya está `ASIGNADO`: se cambia el cadete (reasignación). El
+          estado no cambia, así que no se envía mail; el historial registra
+          la reasignación.
+        - Si el envío ya fue retirado o terminó (`RETIRADO`, `EN_CAMINO`,
+          `ENTREGADO`, `NO_ENTREGADO`): se responde `409`.
+
+        Es `PUT` porque es idempotente: asignar dos veces el mismo cadete
+        deja el envío igual y no genera un segundo mail.
+      operationId: asignarEnvio
+      x-corte: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AsignacionRequest'
+            example:
+              cadeteId: 7
+      responses:
+        '200':
+          description: Envío asignado. Devuelve el envío actualizado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnvioDetalle'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: El envío ya no se puede asignar por su estado actual.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                codigo: ESTADO_INVALIDO
+                mensaje: No se puede asignar un envío en estado EN_CAMINO.
+        '422':
+          description: El cadete no existe o está inactivo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                codigo: CADETE_INVALIDO
+                mensaje: El cadete 7 no está activo.
+
+  /envios/{envioId}/estados:
+    parameters:
+      - $ref: '#/components/parameters/EnvioId'
+    get:
+      tags: [Estados]
+      summary: Ver el historial de estados de un envío
+      description: |
+        Devuelve los cambios de estado del envío, del más antiguo al más
+        reciente. Es el mismo `historial` que viene en `GET /envios/{envioId}`;
+        este endpoint existe para quien solo necesita la línea de tiempo.
+
+        Mismas reglas de visibilidad que `GET /envios/{envioId}`: si el
+        usuario no puede ver el envío, se responde `404`.
+      operationId: listarEstados
+      responses:
+        '200':
+          description: Historial del envío.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CambioEstado'
+              example:
+                - estado: PENDIENTE
+                  fecha: '2026-10-22T10:15:00-03:00'
+                  realizadoPor: { id: 3, nombre: Estudio Contable Pérez }
+                  observacion: null
+                - estado: ASIGNADO
+                  fecha: '2026-10-22T10:32:00-03:00'
+                  realizadoPor: { id: 2, nombre: Operador Central }
+                  observacion: Asignado a Juan Pérez
+                - estado: RETIRADO
+                  fecha: '2026-10-22T11:05:00-03:00'
+                  realizadoPor: { id: 7, nombre: Juan Pérez }
+                  observacion: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      tags: [Estados]
+      summary: Cambiar el estado de un envío
+      description: |
+        **Rol requerido:** `CADETE`, y solo sobre envíos asignados a él.
+
+        Registra un nuevo estado en el historial, actualiza el `estado` del
+        envío y **envía un mail al cliente**. Es el único endpoint que mueve
+        el estado de un envío después de la asignación, así que la
+        validación de transiciones (ver `EstadoEnvio`) vive en un solo lugar.
+
+        Pensado para RNF 03: en la app del cadete cada estado es un botón
+        ("Retirado", "En camino", "Entregado", "No se pudo entregar") que
+        hace este `POST` directamente.
+
+        Errores:
+        - `403` si el usuario no es cadete.
+        - `404` si el envío no existe o no está asignado a este cadete.
+        - `409` si la transición no está permitida (ej. `ASIGNADO` → `ENTREGADO`)
+          o el envío ya está en un estado final.
+        - `422` si se manda `NO_ENTREGADO` sin `observacion`.
+      operationId: cambiarEstado
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CambioEstadoRequest'
+            examples:
+              retirado:
+                summary: Retiró el paquete
+                value:
+                  estado: RETIRADO
+              noEntregado:
+                summary: No se pudo entregar
+                value:
+                  estado: NO_ENTREGADO
+                  observacion: Nadie atendió en el domicilio
+      responses:
+        '201':
+          description: Cambio registrado. Devuelve el envío actualizado.
+          headers:
+            Location:
+              description: URL del historial de estados del envío.
+              schema:
+                type: string
+                example: /api/v1/envios/42/estados
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnvioDetalle'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Transición de estado no permitida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                codigo: TRANSICION_INVALIDA
+                mensaje: No se puede pasar de ASIGNADO a ENTREGADO.
+        '422':
+          description: Falta la observación obligatoria para `NO_ENTREGADO`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                codigo: OBSERVACION_REQUERIDA
+                mensaje: Indicá el motivo por el que no se pudo entregar.
+
+  /cadetes:
+    get:
+      tags: [Cadetes]
+      summary: Listar cadetes
+      description: |
+        **Rol requerido:** `OPERADOR`.
+
+        Devuelve los cadetes con la cantidad de envíos activos de cada uno
+        (asignados y todavía no terminados), para que el operador elija a
+        quién asignar. Con 8 cadetes no hace falta paginar.
+      operationId: listarCadetes
+      x-corte: true
+      parameters:
+        - name: activo
+          in: query
+          description: Si es `true` (por defecto) devuelve solo los cadetes activos.
+          required: false
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: Lista de cadetes.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Cadete'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token obtenido en `POST /auth/login`.
+
+  parameters:
+    EnvioId:
+      name: envioId
+      in: path
+      required: true
+      description: ID del envío.
+      schema:
+        type: integer
+        format: int64
+        example: 42
+    Pagina:
+      name: pagina
+      in: query
+      required: false
+      description: Número de página, empezando en 1.
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    TamanioPagina:
+      name: tamanio
+      in: query
+      required: false
+      description: Cantidad de envíos por página.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+  schemas:
+    Rol:
+      type: string
+      enum: [CLIENTE, OPERADOR, CADETE]
+
+    Usuario:
+      type: object
+      required: [id, nombre, email, rol]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 3
+        nombre:
+          type: string
+          example: Estudio Contable Pérez
+        email:
+          type: string
+          format: email
+          example: contacto@estudioperez.com
+        rol:
+          $ref: '#/components/schemas/Rol'
+
+    UsuarioResumen:
+      type: object
+      description: Versión reducida de un usuario, para incrustar en otros recursos.
+      required: [id, nombre]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 3
+        nombre:
+          type: string
+          example: Estudio Contable Pérez
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+          minLength: 8
+
+    LoginResponse:
+      type: object
+      required: [token, expiraEn, usuario]
+      properties:
+        token:
+          type: string
+          description: 'JWT a enviar en el header `Authorization: Bearer <token>`.'
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        expiraEn:
+          type: integer
+          description: Segundos hasta que el token expira.
+          example: 28800
+        usuario:
+          $ref: '#/components/schemas/Usuario'
+
+    EstadoEnvio:
+      type: string
+      description: |
+        Estado del ciclo de vida de un envío. Transiciones permitidas:
+
+        | Desde | Hacia | Quién |
+        |---|---|---|
+        | `PENDIENTE` | `ASIGNADO` | Operador (al asignar) |
+        | `ASIGNADO` | `RETIRADO` | Cadete |
+        | `ASIGNADO` | `NO_ENTREGADO` | Cadete (no pudo retirar) |
+        | `RETIRADO` | `EN_CAMINO` | Cadete |
+        | `EN_CAMINO` | `ENTREGADO` | Cadete |
+        | `EN_CAMINO` | `NO_ENTREGADO` | Cadete |
+
+        `ENTREGADO` y `NO_ENTREGADO` son finales.
+
+        Las transiciones viven en una tabla del módulo de envíos, no
+        repartidas por el código: agregar un estado nuevo (por ejemplo
+        `DEMORADO`, TS 05) implica sumar el valor a este enum y sus filas a
+        la tabla, sin tocar otros módulos (RNF 05).
+      enum: [PENDIENTE, ASIGNADO, RETIRADO, EN_CAMINO, ENTREGADO, NO_ENTREGADO]
+      example: ASIGNADO
+
+    DireccionInput:
+      type: object
+      description: Dirección tal como la carga el cliente.
+      required: [calle, localidad]
+      properties:
+        calle:
+          type: string
+          description: Calle, número, y piso/depto si corresponde.
+          maxLength: 200
+          example: Av. Corrientes 1234, piso 3 B
+        localidad:
+          type: string
+          maxLength: 100
+          example: CABA
+        referencias:
+          type: string
+          description: Indicaciones para el cadete.
+          maxLength: 300
+          example: Timbre roto, llamar al llegar
+
+    Direccion:
+      description: Dirección guardada, con las coordenadas obtenidas del servicio de mapas.
+      allOf:
+        - $ref: '#/components/schemas/DireccionInput'
+        - type: object
+          properties:
+            latitud:
+              type: number
+              format: double
+              nullable: true
+              description: '`null` si el servicio de mapas no pudo geocodificarla.'
+              example: -34.6037
+            longitud:
+              type: number
+              format: double
+              nullable: true
+              example: -58.3816
+
+    Destinatario:
+      type: object
+      required: [nombre]
+      properties:
+        nombre:
+          type: string
+          maxLength: 100
+          example: María Gómez
+        telefono:
+          type: string
+          maxLength: 30
+          example: '+54 11 5555-1234'
+
+    CrearEnvioRequest:
+      type: object
+      required: [origen, destino, destinatario]
+      properties:
+        origen:
+          $ref: '#/components/schemas/DireccionInput'
+        destino:
+          $ref: '#/components/schemas/DireccionInput'
+        destinatario:
+          $ref: '#/components/schemas/Destinatario'
+        descripcion:
+          type: string
+          description: Qué se envía.
+          maxLength: 300
+          example: Sobre con documentación contable
+
+    Envio:
+      type: object
+      description: Envío tal como aparece en los listados.
+      required: [id, cliente, origen, destino, destinatario, estado, creadoEn, actualizadoEn]
+      properties:
+        id:
+          type: integer
+          format: int64
+          readOnly: true
+          example: 42
+        cliente:
+          $ref: '#/components/schemas/UsuarioResumen'
+        origen:
+          $ref: '#/components/schemas/Direccion'
+        destino:
+          $ref: '#/components/schemas/Direccion'
+        destinatario:
+          $ref: '#/components/schemas/Destinatario'
+        descripcion:
+          type: string
+          nullable: true
+          example: Sobre con documentación contable
+        estado:
+          $ref: '#/components/schemas/EstadoEnvio'
+        cadete:
+          description: Cadete asignado. `null` mientras el envío está `PENDIENTE`.
+          type: object
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/UsuarioResumen'
+        tiempoEstimadoMinutos:
+          type: integer
+          nullable: true
+          description: Estimación del servicio de mapas, calculada una sola vez al crear el envío.
+          example: 25
+        creadoEn:
+          type: string
+          format: date-time
+          readOnly: true
+          example: '2026-10-22T10:15:00-03:00'
+        actualizadoEn:
+          type: string
+          format: date-time
+          readOnly: true
+          example: '2026-10-22T10:32:00-03:00'
+
+    EnvioDetalle:
+      description: Envío con su historial de cambios. Lo devuelve la consulta individual.
+      allOf:
+        - $ref: '#/components/schemas/Envio'
+        - type: object
+          required: [historial]
+          properties:
+            historial:
+              type: array
+              description: Cambios ordenados del más antiguo al más reciente.
+              items:
+                $ref: '#/components/schemas/CambioEstado'
+
+    CambioEstado:
+      type: object
+      description: Un registro del historial del envío.
+      required: [estado, fecha, realizadoPor]
+      properties:
+        estado:
+          $ref: '#/components/schemas/EstadoEnvio'
+        fecha:
+          type: string
+          format: date-time
+          example: '2026-10-22T10:32:00-03:00'
+        realizadoPor:
+          $ref: '#/components/schemas/UsuarioResumen'
+        observacion:
+          type: string
+          nullable: true
+          maxLength: 300
+          example: Asignado a Juan Pérez
+
+    CambioEstadoRequest:
+      type: object
+      required: [estado]
+      properties:
+        estado:
+          description: |
+            Estado nuevo. Solo se aceptan los que puede marcar un cadete:
+            `RETIRADO`, `EN_CAMINO`, `ENTREGADO`, `NO_ENTREGADO`.
+          allOf:
+            - $ref: '#/components/schemas/EstadoEnvio'
+        observacion:
+          type: string
+          maxLength: 300
+          description: |
+            Opcional, salvo con `NO_ENTREGADO`: ahí es obligatoria para que
+            el cliente sepa el motivo (llega en el mail).
+          example: Nadie atendió en el domicilio
+
+    PaginaEnvios:
+      type: object
+      required: [items, pagina, tamanio, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Envio'
+        pagina:
+          type: integer
+          example: 1
+        tamanio:
+          type: integer
+          example: 20
+        total:
+          type: integer
+          description: Cantidad total de envíos que cumplen el filtro.
+          example: 83
+
+    Cadete:
+      type: object
+      required: [id, nombre, activo, enviosActivos]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 7
+        nombre:
+          type: string
+          example: Juan Pérez
+        telefono:
+          type: string
+          nullable: true
+          example: '+54 11 4444-9876'
+        activo:
+          type: boolean
+          description: '`false` si el cadete no trabaja más o está de licencia.'
+          example: true
+        enviosActivos:
+          type: integer
+          description: Envíos asignados que todavía no están en un estado final.
+          example: 3
+
+    AsignacionRequest:
+      type: object
+      required: [cadeteId]
+      properties:
+        cadeteId:
+          type: integer
+          format: int64
+          example: 7
+
+    Error:
+      type: object
+      required: [codigo, mensaje]
+      properties:
+        codigo:
+          type: string
+          description: Código de error estable, pensado para el frontend.
+          example: VALIDACION
+        mensaje:
+          type: string
+          description: Mensaje legible para el usuario.
+          example: El campo email es obligatorio.
+
+  responses:
+    BadRequest:
+      description: El cuerpo de la petición es inválido.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Falta el token o es inválido / expiró.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            codigo: NO_AUTENTICADO
+            mensaje: Token inválido o expirado.
+    Forbidden:
+      description: El rol del usuario no permite esta operación.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            codigo: SIN_PERMISO
+            mensaje: Esta operación requiere rol OPERADOR.
+    NotFound:
+      description: El recurso no existe (o no es visible para este usuario).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
